@@ -1,0 +1,112 @@
+name: Build RapidLearn Android APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rapidlearn-android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build installable Android debug APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools'
+
+      - name: Install Android SDK packages
+        run: |
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+      - name: Validate deployed RapidLearn website
+        env:
+          RAPIDLEARN_URL: ${{ vars.RAPIDLEARN_URL }}
+        run: |
+          test -n "$RAPIDLEARN_URL" || (echo "Add RAPIDLEARN_URL under Settings > Secrets and variables > Actions > Variables." && exit 1)
+          case "$RAPIDLEARN_URL" in
+            https://*) ;;
+            *) echo "RAPIDLEARN_URL must be a public HTTPS URL."; exit 1 ;;
+          esac
+          curl --fail --location --silent --show-error --retry 5 --retry-delay 5 "$RAPIDLEARN_URL" -o /dev/null
+          echo "RapidLearn website is reachable."
+
+      - name: Generate Capacitor Android wrapper
+        env:
+          RAPIDLEARN_URL: ${{ vars.RAPIDLEARN_URL }}
+          ANDROID_APP_ID: ${{ vars.ANDROID_APP_ID }}
+        run: node scripts/create-capacitor-wrapper.mjs
+
+      - name: Install Capacitor 7
+        working-directory: android-wrapper
+        run: |
+          npm install --no-audit --no-fund \
+            @capacitor/core@^7 \
+            @capacitor/cli@^7 \
+            @capacitor/android@^7 \
+            @capacitor/status-bar@^7
+
+      - name: Generate and sync Android project
+        working-directory: android-wrapper
+        run: |
+          npx cap add android
+          npx cap sync android
+
+      - name: Configure Android SDK target
+        working-directory: android-wrapper
+        run: |
+          node --input-type=module -e '
+            import fs from "node:fs";
+            const file = "android/variables.gradle";
+            if (!fs.existsSync(file)) {
+              console.error("Capacitor Android variables.gradle was not generated.");
+              process.exit(1);
+            }
+            let source = fs.readFileSync(file, "utf8");
+            if (!/targetSdkVersion\s*=\s*\d+/.test(source)) {
+              console.error("Could not find targetSdkVersion in variables.gradle.");
+              process.exit(1);
+            }
+            source = source.replace(/(targetSdkVersion\s*=\s*)\d+/, (_match, prefix) => `${prefix}34`);
+            fs.writeFileSync(file, source);
+          '
+
+      - name: Build Android debug APK
+        working-directory: android-wrapper/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Upload installable APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: rapidlearn-android-debug-${{ github.run_number }}
+          path: android-wrapper/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 30
